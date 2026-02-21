@@ -1,0 +1,394 @@
+import os
+import re
+import socket
+import hashlib
+import requests
+import concurrent.futures
+from flask import Flask, request, jsonify, render_template_string
+from dataclasses import dataclass, field
+from typing import List, Dict
+from urllib.parse import urlparse
+
+# --- ОПЦИОНАЛЬНЫЕ ЗАВИСИМОСТИ ---
+try:
+    import phonenumbers
+    from phonenumbers import geocoder, carrier
+    PHONE_EXT_AVAILABLE = True
+except ImportError:
+    PHONE_EXT_AVAILABLE = False
+
+try:
+    import whois
+    WHOIS_AVAILABLE = True
+except ImportError:
+    WHOIS_AVAILABLE = False
+
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+# ---------------------------------
+
+app = Flask(__name__)
+
+# =========================
+# DATA MODELS
+# =========================
+@dataclass
+class Identity:
+    input_value: str
+    usernames: List[str] = field(default_factory=list)
+    emails: List[str] = field(default_factory=list)
+    phones: List[str] = field(default_factory=list)
+    profiles: Dict[str, str] = field(default_factory=dict)
+    domains: List[str] = field(default_factory=list)
+    timeline: List[Dict] = field(default_factory=list)
+    leaks_found: List[str] = field(default_factory=list)
+
+# =========================
+# CORE UTILS
+# =========================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 OSINT-Framework/6.0"
+}
+
+def is_email(v: str) -> bool:
+    return re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", v) is not None
+
+def is_phone(v: str) -> bool:
+    clean_v = re.sub(r"[\s\-\(\)]", "", v)
+    return re.match(r"^\+?\d{8,15}$", clean_v) is not None
+
+def is_domain(v: str) -> bool: 
+    if "." not in v or " " in v or "@" in v: 
+        return False
+    try: 
+        return bool(urlparse(f"http://{v}").netloc)
+    except Exception: 
+        return False
+
+# =========================
+# ENGINE: ОСНОВНАЯ ЛОГИКА
+# =========================
+class OSINT:
+    def __init__(self, target: str):
+        self.target = target.strip()
+        self.identity = Identity(input_value=self.target)
+
+    # -------- USERNAME RECON (Многопоточный) --------
+    def _check_platform(self, name: str, url: str, username: str):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            if r.status_code == 200 and username.lower() in r.text.lower():
+                self.identity.profiles[name] = url
+        except requests.RequestException:
+            pass
+
+    def username_search(self, username: str):
+        platforms = {
+            "GitHub": f"https://github.com/{username}",
+            "Instagram": f"https://www.instagram.com/{username}/",
+            "Twitter(X)": f"https://twitter.com/{username}",
+            "Reddit": f"https://www.reddit.com/user/{username}",
+            "TikTok": f"https://www.tiktok.com/@{username}",
+            "Steam": f"https://steamcommunity.com/id/{username}",
+            "VKontakte": f"https://vk.com/{username}",
+            "Medium": f"https://medium.com/@{username}",
+            "SoundCloud": f"https://soundcloud.com/{username}",
+            "Linktree": f"https://linktr.ee/{username}"
+        }
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            for name, url in platforms.items():
+                executor.submit(self._check_platform, name, url, username)
+
+    # -------- GITHUB API --------
+    def github_intel(self, username: str):
+        try:
+            r = requests.get(f"https://api.github.com/users/{username}", headers=HEADERS, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                self.identity.timeline.append({
+                    "service": "GitHub Data",
+                    "name": data.get("name"),
+                    "bio": data.get("bio"),
+                    "company": data.get("company"),
+                    "location": data.get("location"),
+                })
+        except requests.RequestException:
+            pass
+
+    # -------- TELEGRAM CHECK --------
+    def telegram_check(self, username: str):
+        try:
+            r = requests.get(f"https://t.me/{username}", headers=HEADERS, timeout=5)
+            if "tgme_page_title" in r.text and "Send Message" in r.text:
+                self.identity.profiles["Telegram"] = f"https://t.me/{username}"
+        except requests.RequestException:
+            pass
+
+    # -------- PHONE INTELLIGENCE --------
+    def phone_intel(self, phone: str):
+        clean = re.sub(r"[\s\-\(\)]", "", phone)
+        full = clean if clean.startswith("+") else f"+{clean}"
+        raw = clean.replace("+", "")
+        self.identity.phones.append(full)
+
+        if PHONE_EXT_AVAILABLE:
+            try:
+                p = phonenumbers.parse(full)
+                if phonenumbers.is_valid_number(p):
+                    desc = geocoder.description_for_number(p, 'ru')
+                    carr = carrier.name_for_number(p, 'ru')
+                    self.identity.timeline.append({
+                        "event": "Geo-Carrier Info",
+                        "location": desc or "Unknown",
+                        "carrier": carr or "Unknown"
+                    })
+            except phonenumbers.NumberParseException:
+                pass
+
+        self.identity.profiles["WhatsApp"] = f"https://wa.me/{raw}"
+        self.identity.profiles["Viber"] = f"viber://chat?number={raw}"
+        self.identity.profiles["Telegram_By_Phone"] = f"https://t.me/+{raw}"
+        
+        dorks = {
+            "Google_Global": f"https://www.google.com/search?q=\"{full}\"+OR+\"{raw}\"",
+            "VK_Search": f"https://www.google.com/search?q=site:vk.com+\"{raw}\"",
+            "Avito_Search": f"https://www.google.com/search?q=site:avito.ru+\"{raw}\"",
+            "GetContact_Web": f"https://www.google.com/search?q=site:getcontact.com+\"{raw}\""
+        }
+        for d_name, d_url in dorks.items():
+            self.identity.profiles[d_name] = d_url
+
+    # -------- EMAIL INTELLIGENCE (Gravatar + HIBP) --------
+    def email_intel(self, email: str):
+        # 1. Leak Check Stub
+        self.identity.timeline.append({"event": "Leak Search", "status": "Request sent to HIBP (Stub)"})
+        
+        # 2. Gravatar Lookup
+        email_hash = hashlib.md5(email.lower().encode('utf-8')).hexdigest()
+        gravatar_url = f"https://www.gravatar.com/avatar/{email_hash}?d=404"
+        try:
+            r = requests.get(gravatar_url, headers=HEADERS, timeout=5)
+            if r.status_code == 200:
+                self.identity.profiles["Gravatar"] = f"https://en.gravatar.com/{email_hash}"
+                self.identity.timeline.append({"event": "Avatar Found", "source": "Gravatar"})
+        except requests.RequestException:
+            pass
+
+    # -------- DOMAIN INTEL (DNS + WHOIS) --------
+    def domain_intel(self, domain: str):
+        self.identity.domains.append(domain)
+        
+        # 1. IP Resolution
+        try:
+            ip = socket.gethostbyname(domain)
+            self.identity.timeline.append({"event": "DNS Resolution", "domain": domain, "ip": ip})
+        except socket.gaierror:
+            self.identity.timeline.append({"event": "DNS Resolution", "error": "Failed"})
+
+        # 2. WHOIS
+        if WHOIS_AVAILABLE:
+            try:
+                w = whois.whois(domain)
+                self.identity.timeline.append({
+                    "event": "WHOIS Data",
+                    "registrar": w.registrar,
+                    "creation_date": str(w.creation_date[0]) if isinstance(w.creation_date, list) else str(w.creation_date)
+                })
+            except Exception:
+                pass
+
+        # 3. DNS Records (MX, TXT)
+        if DNS_AVAILABLE:
+            for record_type in ['MX', 'TXT']:
+                try:
+                    answers = dns.resolver.resolve(domain, record_type)
+                    records = [r.to_text() for r in answers]
+                    self.identity.timeline.append({"event": f"DNS {record_type} Records", "data": records})
+                except Exception:
+                    pass
+
+    # -------- MAIN RUNNER --------
+    def run(self) -> Dict:
+        if is_email(self.target):
+            self.identity.emails.append(self.target)
+            self.email_intel(self.target)
+            self.username_search(self.target.split("@")[0])
+            self.github_intel(self.target.split("@")[0])
+        elif is_phone(self.target):
+            self.phone_intel(self.target)
+        elif is_domain(self.target):
+            self.domain_intel(self.target)
+        else:
+            self.identity.usernames.append(self.target)
+            self.username_search(self.target)
+            self.github_intel(self.target)
+            self.telegram_check(self.target)
+        
+        return self.identity.__dict__
+
+
+# =========================
+# FLASK WEB INTERFACE
+# =========================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>OSINT FRAMEWORK | PRIVATE TERMINAL</title>
+    <style>
+        :root { --main-color: #00ff41; --bg-color: #050505; --card-bg: #0a0a0a; }
+        body { background: var(--bg-color); color: var(--main-color); font-family: 'Courier New', Courier, monospace; margin: 0; padding: 20px; }
+        .terminal { max-width: 1100px; margin: auto; border: 1px solid var(--main-color); padding: 20px; box-shadow: 0 0 20px rgba(0, 255, 65, 0.2); }
+        header { text-align: center; border-bottom: 1px dashed var(--main-color); margin-bottom: 20px; padding-bottom: 10px; }
+        .controls { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        input { background: #000; border: 1px solid var(--main-color); color: var(--main-color); width: 50%; min-width: 300px; padding: 12px; font-size: 1.1em; outline: none; }
+        input:focus { box-shadow: inset 0 0 5px var(--main-color); }
+        button { background: var(--main-color); color: #000; border: none; padding: 12px 25px; font-weight: bold; cursor: pointer; text-transform: uppercase; transition: 0.2s; }
+        button:hover { background: #fff; box-shadow: 0 0 10px #fff; }
+        .btn-secondary { background: transparent; color: var(--main-color); border: 1px solid var(--main-color); }
+        .btn-secondary:hover { background: var(--main-color); color: #000; }
+        
+        #output { margin-top: 20px; line-height: 1.6; }
+        .card { background: var(--card-bg); border-left: 3px solid var(--main-color); padding: 15px; margin-bottom: 20px; }
+        .card h2 { margin-top: 0; font-size: 1.2em; border-bottom: 1px solid #222; padding-bottom: 5px; }
+        .label { color: #888; text-transform: uppercase; font-size: 0.85em; }
+        a { color: #5c5cff; text-decoration: none; }
+        a:hover { color: var(--main-color); text-decoration: underline; }
+        pre { background: #000; padding: 15px; border: 1px solid #222; overflow-x: auto; font-size: 0.85em; color: #aaa; }
+        .blink { animation: blinker 1s linear infinite; font-weight: bold; }
+        @keyframes blinker { 50% { opacity: 0; } }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #222; }
+        th { color: #888; font-weight: normal; }
+    </style>
+</head>
+<body>
+    <div class="terminal">
+        <header>
+            <h1>> OSINT.NEXUS_v6.0</h1>
+            <p>ADVANCED TARGET RECONNAISSANCE SYSTEM</p>
+        </header>
+        
+        <div class="controls">
+            <input type="text" id="target" placeholder="Enter Target (Phone, Email, Nickname, Domain)" onkeypress="if(event.key === 'Enter') executeScan()">
+            <button onclick="executeScan()">Execute Recon</button>
+            <button class="btn-secondary" onclick="exportData()" id="exportBtn" style="display:none;">Export JSON</button>
+        </div>
+
+        <div id="loader" style="display:none; text-align: center; margin: 20px;" class="blink">
+            [ ESTABLISHING CONNECTIONS & GATHERING INTEL... ]
+        </div>
+        
+        <div id="output"></div>
+    </div>
+
+    <script>
+        let currentData = null;
+
+        function escapeHtml(unsafe) {
+            return (unsafe || "").toString()
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
+        async function executeScan() {
+            const target = document.getElementById('target').value.trim();
+            const out = document.getElementById('output');
+            const loader = document.getElementById('loader');
+            const exportBtn = document.getElementById('exportBtn');
+            
+            if(!target) return;
+
+            loader.style.display = 'block';
+            out.innerHTML = '';
+            exportBtn.style.display = 'none';
+            currentData = null;
+
+            try {
+                const response = await fetch('/api/scan?target=' + encodeURIComponent(target));
+                if (!response.ok) throw new Error("Network Error");
+                const data = await response.json();
+                currentData = data;
+                
+                let html = '';
+                
+                // Section 1: Profiles & Links
+                if(Object.keys(data.profiles).length > 0) {
+                    html += '<div class="card"><h2>[+] DIGITAL FOOTPRINT / PROFILES</h2><table><tr><th>Platform</th><th>Link</th></tr>';
+                    for(let p in data.profiles) {
+                        let safeUrl = escapeHtml(data.profiles[p]);
+                        html += `<tr><td>${escapeHtml(p)}</td><td><a href="${safeUrl}" target="_blank">${safeUrl}</a></td></tr>`;
+                    }
+                    html += '</table></div>';
+                }
+
+                // Section 2: Timeline & Intel
+                if(data.timeline.length > 0) {
+                    html += '<div class="card"><h2>[*] INTELLIGENCE TIMELINE & EVENTS</h2>';
+                    data.timeline.forEach(t => {
+                        let eventName = escapeHtml(t.event || t.service || "Log");
+                        let details = { ...t };
+                        delete details.event;
+                        delete details.service;
+                        html += `<div><span style="color:#fff;">[${eventName}]</span> <span style="color:#888;">${escapeHtml(JSON.stringify(details))}</span></div>`;
+                    });
+                    html += '</div>';
+                }
+
+                // Section 3: Raw JSON Dump
+                html += '<div class="card"><h2>[#] RAW SYSTEM DUMP</h2><pre>' + escapeHtml(JSON.stringify(data, null, 4)) + '</pre></div>';
+                
+                out.innerHTML = html;
+                exportBtn.style.display = 'inline-block';
+                
+            } catch(e) {
+                out.innerHTML = '<div class="card"><p style="color:red; font-weight:bold;">[!] CRITICAL ERROR: TARGET RESOLUTION FAILED.</p></div>';
+                console.error(e);
+            } finally {
+                loader.style.display = 'none';
+            }
+        }
+
+        function exportData() {
+            if(!currentData) return;
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentData, null, 2));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href", dataStr);
+            downloadAnchorNode.setAttribute("download", "osint_report_" + currentData.input_value + ".json");
+            document.body.appendChild(downloadAnchorNode);
+            downloadAnchorNode.click();
+            downloadAnchorNode.remove();
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/scan')
+def api_scan():
+    target = request.args.get('target')
+    if not target: 
+        return jsonify({"error": "No target provided"}), 400
+    
+    engine = OSINT(target)
+    return jsonify(engine.run())
+
+if __name__ == '__main__':
+    print("[*] OSINT Framework Initializing...")
+    print(f"[-] Phone Extensions: {'ACTIVE' if PHONE_EXT_AVAILABLE else 'MISSING (pip install phonenumbers)'}")
+    print(f"[-] WHOIS Module: {'ACTIVE' if WHOIS_AVAILABLE else 'MISSING (pip install python-whois)'}")
+    print(f"[-] DNS Module: {'ACTIVE' if DNS_AVAILABLE else 'MISSING (pip install dnspython)'}")
+    app.run(host='0.0.0.0', port=8080, debug=True)
